@@ -1,8 +1,0 @@
-openai>=1.0.0
-chromadb>=0.4.22
-Flask==2.3.3
-twilio==8.9.0
-python-dotenv==1.0.0
-gunicorn==21.2.0
-httpx==0.25.2
-waitress==2.1.2
