@@ -1,0 +1,610 @@
+# ==============================================================================
+# FELIX AI SOLUTIONS - API DEL CANDIDATO DIGITAL (v29.1 "PRODUCCIÓN FINAL")
+# Basado en la arquitectura v29.0 "Maestro", con una Guardia de Moderación
+# mejorada que responde en lugar de quedarse en silencio.
+# ==============================================================================
+
+import os
+import re
+import time
+import random
+import json
+from datetime import datetime
+from io import StringIO
+import openai
+import chromadb
+import pandas as pd
+from dotenv import load_dotenv
+from flask import Flask, request
+from huggingface_hub import HfApi, HfFolder, hf_hub_download
+from twilio.twiml.messaging_response import MessagingResponse
+
+# --- CONFIGURACIÓN GLOBAL Y CONSTANTES ---
+load_dotenv()
+app = Flask(__name__)
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY: raise ValueError("No se encontró la Clave API de OpenAI.")
+openai.api_key = OPENAI_API_KEY
+
+HF_TOKEN = os.getenv("HUGGING_FACE_TOKEN")
+HF_USERNAME = os.getenv("HUGGING_FACE_USERNAME")
+HF_REPO_ID = f"{HF_USERNAME}/candidato-digital-logs" if HF_USERNAME else None
+
+if HF_TOKEN:
+    HfFolder.save_token(HF_TOKEN)
+    hf_api = HfApi()
+else:
+    print("ADVERTENCIA: No se encontró el HUGGING_FACE_TOKEN.")
+
+client_chroma = chromadb.PersistentClient(path="./chroma_db")
+collection = client_chroma.get_or_create_collection(name="candidato_ia_stable")
+CEREBRO_CARGADO = False
+
+USER_SESSIONS = {}
+GREETING_KEYWORDS = ["hola", "buenas", "buenos", "buen", "qué tal", "como estas", "quihubo", "saludos"]
+IDENTITY_KEYWORDS = ["quién eres", "quien eres", "eres un bot", "eres una ia", "eres una i.a.", "eres una máquina", "eres una maquina", "eres un programa", "hablo con una persona", "eres real"]
+
+WELCOME_MESSAGE = """
+¡Hola! Soy el Candidato Digital de Javier Montoya, un asistente de IA entrenado para responder tus preguntas sobre su plan de gobierno para el Quindío.
+
+Estoy aquí para ayudarte 24/7. Pregúntame sobre seguridad, economía, medio ambiente o cualquier otra de sus propuestas.
+
+*Aviso Importante: Soy un agente de inteligencia artificial. La información que proporciono es de carácter informativo y puede contener imprecisiones. Mis respuestas no constituyen un compromiso vinculante por parte del candidato.*
+"""
+MEDIA_FALLBACK_MESSAGE = "Gracias por tu mensaje. En este momento solo puedo procesar preguntas escritas. Por favor, envía tu consulta en un mensaje de texto."
+IDENTITY_FALLBACK_MESSAGE = """
+Para ser completamente transparente contigo: soy el Candidato Digital, un agente de inteligencia artificial que actúa en nombre de Javier Montoya.
+
+He sido entrenado con su plan de gobierno para responder de la manera más fiel posible a su pensamiento. Sin embargo, soy un programa informático y puedo cometer errores.
+
+La información que proporciono es de carácter informativo y no debe considerarse una comunicación directa o un compromiso vinculante del candidato.
+"""
+FALLBACK_RESPONSES = [
+    "No estoy seguro de haber entendido bien tu pregunta. ¿Podrías reformularla de una manera más clara?",
+    "Esa es una pregunta interesante. Para poder darte la mejor respuesta, ¿podrías plantearla de otra forma?",
+    "Hmm, no encontré información específica sobre eso en mi plan. ¿Puedes intentar preguntarme de nuevo con otras palabras?"
+]
+
+# --- FUNCIONES AUXILIARES ---
+
+def classify_topic_api(query):
+    categories = "Seguridad, Economía, Salud, Educación, Infraestructura, Social, Medio Ambiente, Finanzas de Campaña, Sobre el Candidato, Saludo/Otro"
+    prompt = f"Clasifica la siguiente pregunta en UNA de las siguientes categorías: {categories}.\nPregunta: '{query}'\nResponde únicamente con la categoría."
+    try:
+        response = openai.ChatCompletion.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.0)
+        return response.choices[0].message['content'].strip()
+    except Exception as e:
+        print(f"ERROR al clasificar tema: {e}")
+        return "Error de Clasificación"
+
+def analyze_sentiment_api(query):
+    sentiments_options = "Positivo, Neutro, Negativo"
+    prompt = f"Clasifica el sentimiento de la siguiente frase como UNA de las siguientes opciones: {sentiments_options}.\nFrase: '{query}'\nResponde únicamente con el sentimiento."
+    try:
+        response = openai.ChatCompletion.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.0)
+        return response.choices[0].message['content'].strip()
+    except Exception as e:
+        print(f"ERROR al analizar sentimiento: {e}")
+        return "Error de Sentimiento"
+
+def update_cumulative_log_on_hf(new_log_data):
+    if not HF_TOKEN or not HF_REPO_ID:
+        print("Actualización de log omitida.")
+        return
+    repo_filename = "log.csv"
+    headers = ['timestamp', 'user_id', 'user_query', 'retrieved_context', 'ai_response', 'moderation_flags', 'response_time_ms', 'topic', 'sentiment']
+    try:
+        log_file_path = hf_hub_download(repo_id=HF_REPO_ID, filename=repo_filename, repo_type="dataset", token=HF_TOKEN)
+        df_historical = pd.read_csv(log_file_path)
+    except Exception:
+        df_historical = pd.DataFrame(columns=headers)
+    new_entry_df = pd.DataFrame([new_log_data])
+    df_updated = pd.concat([df_historical, new_entry_df], ignore_index=True)
+    try:
+        csv_buffer = StringIO()
+        df_updated.to_csv(csv_buffer, index=False)
+        csv_buffer.seek(0)
+        hf_api.upload_file(
+            path_or_fileobj=csv_buffer.getvalue().encode("utf-8"),
+            path_in_repo=repo_filename, repo_id=HF_REPO_ID, repo_type="dataset",
+        )
+        print(f"Log acumulativo subido. Total de entradas: {len(df_updated)}")
+    except Exception as e:
+        print(f"ERROR: Falló la subida del log acumulativo: {e}")
+
+def cargar_y_verificar_cerebro():
+    global CEREBRO_CARGADO
+    print("Iniciando verificación y posible carga del cerebro...")
+    campaign_document = """
+    ________________________________________
+
+Documento Maestro de Campaña: Javier Montoya Gobernación
+
+Fecha: 25 de agosto de 2025
+
+De: Jefatura de Campaña
+
+Asunto: Perfil Oficial y Plataforma de Gobierno del Candidato Javier Montoya
+
+________________________________________
+
+Perfil del Candidato
+
+Nombre: Javier Montoya
+
+Partido Político: Renovación Quindiana (RQ)
+
+Eslogan de Campaña: Quindío: Nuestro Origen, Nuestro Futuro.
+
+Biografía: Un Hombre de Nuestra Tierra
+
+Javier Montoya no es un político que descubrió el Quindío en un mapa; es un hombre que lleva el aroma de su café y el verde de sus montañas en el alma. Nacido en Calarcá y criado en una finca familiar en las laderas de Córdoba, Javier aprendió desde niño el valor del trabajo arduo y el profundo respeto por la tierra que nos da todo. Estudió Ingeniería Agroindustrial en la Universidad del Quindío, una decisión que tomó para encontrar nuevas formas de agregar valor a los productos de nuestra región y asegurar que las familias campesinas, como la suya, tuvieran un futuro próspero.
+
+Su carrera es un reflejo de su compromiso. En lugar de buscar oportunidades en las grandes capitales, Javier se dedicó a fortalecer el Quindío desde adentro. Fundó una pequeña empresa de cafés especiales que hoy exporta a tres continentes, demostrando que la innovación y la tradición pueden ir de la mano. Posteriormente, sirvió como Secretario de Desarrollo Económico de Armenia, donde lideró la creación de programas de apoyo a emprendedores y atrajo inversión que generó más de 1.500 empleos directos. Javier no es un político tradicional; es un gestor, un quindiano que conoce los problemas del departamento porque los ha vivido y ha trabajado incansablemente para solucionarlos. Vuelve ahora a la arena pública con la experiencia, la visión y la determinación para llevar al Quindío a un nuevo nivel de desarrollo y bienestar.
+
+________________________________________
+
+Pilares del Plan de Gobierno
+
+Nuestra visión para el Quindío se sostiene sobre tres pilares fundamentales, diseñados a partir de las necesidades reales de nuestra gente y el potencial inmenso de nuestra tierra.
+
+Pilar 1: Quindío Próspero y Conectado 
+
+El futuro económico del Quindío depende de nuestra capacidad para innovar sin perder nuestra esencia. No podemos seguir dependiendo de los vaivenes de un solo sector. Mi plan es diversificar y fortalecer nuestra economía, asegurando que la prosperidad llegue a cada rincón del departamento, desde Armenia hasta Génova.
+
+¿Cómo lo haremos?
+
+Centro de Innovación Agroindustrial: Crearemos un centro tecnológico en alianza con la universidad y el sector privado para desarrollar productos con valor agregado a partir del café, el plátano, los cítricos y otros cultivos locales. No más venta de materia prima a bajo costo; transformaremos nuestros productos aquí.
+
+Programa "Caminos del Café": Invertiremos una cifra histórica en la recuperación y pavimentación de las vías terciarias. Un campesino que puede sacar su cosecha de forma rápida y segura es un campesino que prospera. Conectaremos las fincas con los mercados y los corredores turísticos.
+
+Conectividad Digital Rural: Llevaremos internet de alta velocidad a las zonas rurales para potenciar el agroturismo, la educación a distancia y facilitar que nuestros jóvenes puedan trabajar y emprender desde sus municipios.
+
+Pilar 2: Corazón Verde y Seguro 
+
+El Quindío es el corazón verde de Colombia, y nuestro deber es protegerlo como el tesoro que es. Al mismo tiempo, nuestros ciudadanos merecen vivir sin miedo, en calles y barrios seguros. Este pilar integra la defensa de nuestro patrimonio natural con una estrategia frontal contra la delincuencia, porque no hay calidad de vida si falta la tranquilidad o el aire puro.
+
+¿Cómo lo haremos?
+
+Defensa del Territorio: Mi posición es clara e innegociable: No a la megaminería en Salento ni en ningún municipio que ponga en riesgo nuestras fuentes de agua y nuestro Paisaje Cultural Cafetero. Fortaleceremos la autoridad ambiental (CRQ) y crearemos un fondo de "pago por servicios ambientales" para que los campesinos que conservan los bosques sean recompensados.
+
+Seguridad Inteligente y Comunitaria: Implementaremos un sistema de vigilancia con drones para las zonas rurales y perímetros urbanos, disuadiendo el abigeato y el hurto. Crearemos una App ciudadana de "Alerta Temprana" conectada directamente con cuadrantes de la policía y fortaleceremos los Frentes de Seguridad Ciudadana con tecnología y comunicación.
+
+Lucha Frontal contra el Microtráfico: Crearemos una unidad especial de la policía, en coordinación con la fiscalía, dedicada exclusivamente a desmantelar las redes de microtráfico que envenenan a nuestros jóvenes en los barrios de Armenia, Calarcá y Montenegro.
+
+Pilar 3: Oportunidades para Nuestra Gente 
+
+El mayor activo del Quindío es su gente. Sin embargo, por años hemos visto cómo nuestros jóvenes, faltos de oportunidades, deben abandonar la región. Mi obsesión será crear las condiciones para que el talento quindiano se quede, crezca y triunfe aquí. La educación y el empleo de calidad no son un lujo, son la base de nuestro futuro.
+
+¿Cómo lo haremos?
+
+Programa "Mi Primer Empleo Quindiano": Ofreceremos incentivos fiscales significativos a las empresas que contraten a jóvenes recién egresados de universidades e instituciones técnicas. La condición será un contrato a término indefinido con todas las prestaciones de ley.
+
+Bilingüismo y Pertinencia Educativa: En alianza con el SENA y las secretarías de educación, lanzaremos un plan masivo de bilingüismo enfocado en el turismo y la tecnología. Ajustaremos los programas técnicos y tecnológicos para que respondan a la demanda real del sector productivo del Quindío.
+
+Fondo "Emprende Quindío": Destinaremos un capital semilla anual para financiar los 100 mejores proyectos de emprendimiento de base tecnológica, turística y creativa del departamento, con acompañamiento técnico y mentoría para asegurar su éxito.
+
+________________________________________
+
+Preguntas Frecuentes (FAQ)
+
+¿Cuál es su postura clara sobre la minería en Salento y el Valle de Cocora?
+
+Mi postura es de una defensa férrea e innegociable de nuestro patrimonio. Como gobernador, utilizaré todas las herramientas legales y políticas para impedir cualquier proyecto de megaminería que amenace el Valle de Cocora, nuestras fuentes hídricas o la vocación turística y agrícola de Salento. Nuestra riqueza es verde, no dorada. Protegeré el Paisaje Cultural Cafetero como nuestro mayor activo.
+
+El Quindío tiene una de las tasas de desempleo más altas. ¿Cómo va a generar empleo real y rápido?
+
+El empleo no se genera por decreto. Mi estrategia ataca el problema desde tres frentes: 1) Impulso a la construcción a través de la agilización de licencias y el plan de vías terciarias. 2) Incentivos directos a las empresas para que contraten jóvenes a través del programa "Mi Primer Empleo Quindiano". 3) Fortalecimiento del turismo y la agroindustria, que son nuestros mayores generadores de empleo, con mejor infraestructura y acceso a financiación.
+
+¿De dónde saldrá el dinero para financiar todas estas propuestas?
+
+Seremos responsables y eficientes. La financiación provendrá de cuatro fuentes principales: 1) Optimización del gasto público, eliminando burocracia innecesaria y combatiendo la corrupción. 2) Gestión de recursos del Gobierno Nacional, presentando proyectos bien estructurados ante los ministerios. 3) Alianzas Público-Privadas (APP) para grandes obras de infraestructura. 4) Acceso a recursos de cooperación internacional para proyectos de sostenibilidad y desarrollo social.
+
+¿Qué experiencia tiene usted en el sector público?
+
+Mi experiencia es la combinación ideal: conozco las dificultades del sector privado como empresario y entiendo el funcionamiento del Estado desde mi paso por la Secretaría de Desarrollo Económico. No soy un político de escritorio; soy un gestor que ha dado resultados medibles, como la creación de más de 1.500 empleos. Sé cómo ejecutar un presupuesto, cómo liderar equipos y, lo más importante, cómo transformar las ideas en realidades que beneficien a la gente.
+
+El problema del microtráfico está destruyendo a nuestros jóvenes. ¿Qué hará más allá de aumentar el pie de fuerza?
+
+Es un problema con dos caras: la oferta y la demanda. A la oferta la combatiremos con inteligencia y contundencia, con la unidad especial que he propuesto. Pero la clave está en la demanda: invertiremos en programas de prevención del consumo en colegios, fortaleceremos los centros de rehabilitación y crearemos una red de oportunidades (deporte, cultura, empleo) para que nuestros jóvenes vean un futuro más atractivo que el que les ofrecen las drogas.
+
+¿Por qué debería votar por usted y no por los otros candidatos que llevan años en la política?
+
+Porque el Quindío no puede permitirse seguir haciendo lo mismo y esperar resultados diferentes. Los políticos tradicionales ya tuvieron su oportunidad. Yo no ofrezco promesas vacías, ofrezco un plan concreto basado en mi experiencia como emprendedor y como gestor público. No vivo de la política, vivo para servir al Quindío. Mi compromiso es con el futuro de nuestra gente, no con las maquinarias políticas del pasado.
+
+¿Cómo piensa apoyar a los cafeteros y agricultores que se sienten olvidados?
+
+Yo soy uno de ellos, conozco sus luchas. Mi apoyo será total. El programa "Caminos del Café" es una respuesta directa a su necesidad de mejores vías. El Centro de Innovación Agroindustrial les dará herramientas para vender sus productos a mejor precio. Además, crearemos un programa de asistencia técnica para la adaptación al cambio climático y lucharemos por precios justos y acceso a créditos blandos.
+
+El turismo se concentra en Salento y Filandia. ¿Qué hará por los otros municipios?
+
+El turismo debe ser una fuente de ingresos para todo el departamento. Impulsaremos la "Ruta del Café Mágico", una iniciativa que conectará a los municipios de la cordillera como Pijao, Córdoba y Génova, promoviendo el turismo de naturaleza, avistamiento de aves y experiencias cafeteras auténticas. Digitalizaremos la oferta turística de los 12 municipios y la promocionaremos a nivel nacional e internacional.
+
+¿Cuál es su plan para mejorar la salud en el departamento, especialmente en las zonas rurales?
+
+La salud digna es un derecho. Nuestra prioridad será fortalecer la red de hospitales públicos y los puestos de salud en las veredas, garantizando que tengan los médicos, los medicamentos y los equipos básicos. Implementaremos un sistema de telemedicina para que especialistas desde Armenia puedan atender consultas en municipios apartados y crearemos brigadas de salud móviles que lleguen directamente a las fincas.
+
+¿Cómo garantizará la transparencia en su gobierno y luchará contra la corrupción?
+
+Con total determinación. Implementaremos una plataforma de "Gobierno Abierto" donde todos los contratos y presupuestos serán públicos y accesibles en línea para cualquier ciudadano. Crearemos una "Oficina Anticorrupción" dependiente directamente del despacho del gobernador y estableceremos canales de denuncia anónimos y seguros. En mi gobierno, el que le robe un peso al Quindío se va para la cárcel.
+
+¿Cómo trabajará con los alcaldes del departamento? Mi gobierno será un aliado, no un jefe, para los alcaldes. Crearemos mesas de trabajo intermunicipales permanentes para coordinar proyectos regionales en temas de seguridad, infraestructura y desarrollo económico. Promoveremos la unión de esfuerzos para que el progreso no se concentre en la capital, sino que llegue a cada rincón del Quindío.
+
+
+
+Seguridad y Convivencia
+
+Pregunta: La percepción de inseguridad en barrios de Armenia y Calarcá es alta. ¿Cómo piensa usted fortalecer la seguridad en zonas urbanas específicas? Respuesta: En Armenia, iniciaremos con un plan piloto en 5 barrios críticos (ej. La Cabaña, La Patria, Miraflores) y en Calarcá, en 3 (ej. El Cacique, Giraldo). Invertiremos $2.500 millones en la instalación de 500 nuevas cámaras de seguridad de alta definición con análisis de video para detección de comportamientos sospechosos. Este sistema estará conectado en tiempo real al Centro de Comando, Control y Comunicaciones (C4), que será reactivado y dotado de personal técnico.
+
+Pregunta: ¿Cuál es su estrategia para combatir la extorsión a pequeños comerciantes? Respuesta: Crearemos una "Mesa Técnica Anti-Extorsión" con la participación quincenal del Gaula, la Policía Judicial y representantes de la Cámara de Comercio. Implementaremos un canal de denuncia confidencial a través de una aplicación móvil con encriptación, para que los comerciantes puedan reportar de forma segura. El objetivo es reducir la tasa de no denuncia en un 40% en los primeros 12 meses.
+
+Pregunta: ¿Cómo abordará la violencia intrafamiliar y la seguridad de las mujeres en el departamento? Respuesta: Destinaremos $1.200 millones a la creación de dos "Casas Refugio" en Armenia y Calarcá, con capacidad para 15 mujeres y sus hijos, respectivamente. Estos centros contarán con psicólogos, abogados y trabajadores sociales. Además, implementaremos el programa "Red de Mujeres Vigilantes", que consistirá en capacitaciones sobre autodefensa y primeros auxilios psicológicos.
+
+________________________________________
+
+Economía y Empleo
+
+Pregunta: El Quindío depende del café y el turismo. ¿Qué hará para diversificar la economía y reducir esa dependencia? Respuesta: Crearemos el "Pacto por la Diversificación Productiva". Invertiremos $3.000 millones en la creación del "Quindío Tech Hub", un espacio físico y digital que ofrecerá incentivos fiscales (exención de impuesto de industria y comercio por 5 años) a 20 empresas de software y tecnología que se instalen en el departamento y contraten al menos a 10 profesionales locales. Adicionalmente, crearemos un programa de formación técnica en codificación y analítica de datos en alianza con el SENA para 500 jóvenes.
+
+Pregunta: ¿Cómo apoyará a los pequeños y medianos empresarios (PyMEs) del Quindío? Respuesta: Lanzaremos el programa "Impulso Quindío", un fondo de capital semilla de $2.000 millones. Este fondo otorgará créditos blandos (tasa de interés del IPC + 2%) con un periodo de gracia de 6 meses para proyectos que demuestren viabilidad y generen al menos 3 empleos formales. La primera convocatoria se abrirá a los 90 días de iniciar el gobierno.
+
+Pregunta: Muchos jóvenes se van del Quindío en busca de oportunidades. ¿Cómo los retendrá? Respuesta: Implementaremos el "Programa de Retención de Talento Joven". Firmaremos acuerdos con 100 empresas del departamento para que ofrezcan 300 pasantías remuneradas anuales a estudiantes universitarios de la región. Quienes decidan emprender, tendrán acceso prioritario al fondo "Mi Primer Emprendimiento".
+
+Pregunta: ¿Qué opina sobre la formalización del empleo y la lucha contra el trabajo informal? Respuesta: Propondremos un subsidio a las PyMEs que formalicen a sus trabajadores. La propuesta es que el gobierno departamental cubra el 50% de los aportes a seguridad social (salud y pensión) durante el primer año de formalización de cada empleado, con un tope de 20 empleados por empresa.
+
+Pregunta: ¿Cuál es su visión para el Eje Cafetero como un bloque económico regional? Respuesta: Convocaremos a los gobernadores de Caldas y Risaralda para firmar un "Acuerdo de Competitividad Regional". Mi propuesta específica es la creación de una oficina conjunta de promoción de inversiones para atraer proyectos de infraestructura turística, tecnológica y agroindustrial a gran escala, y así dejar de competir entre nosotros y comenzar a cooperar.
+
+________________________________________
+
+Educación y Cultura
+
+Pregunta: ¿Cómo mejorará la calidad de la educación pública en el Quindío? Respuesta: Renovaremos 20 aulas en 10 instituciones educativas de zonas rurales y las dotaremos con tabletas y conexión satelital para el acceso a plataformas de educación digital. Firmaremos un convenio con el SENA para implementar el programa "Técnico en Mis Manos", que permitirá a 1.000 estudiantes de los grados 10 y 11 obtener una doble titulación técnica en áreas como agroturismo o energías renovables.
+
+Pregunta: ¿Qué hará para fomentar las artes y la cultura local? Respuesta: Reactivaremos el "Fondo Departamental de Estímulos" con un presupuesto de $800 millones anuales. Este fondo entregará becas a 50 jóvenes artistas para que realicen estudios especializados y financiará 30 proyectos culturales locales, incluyendo festivales y la recuperación de espacios públicos como teatros y casas de la cultura.
+
+Pregunta: ¿Cuál es su postura sobre el deporte en el departamento? ¿Qué hará para apoyar a los deportistas? Respuesta: Crearemos el "Plan de Alto Rendimiento Quindiano". Este programa otorgará 50 becas deportivas de $1.5 millones mensuales a deportistas con potencial para que se dediquen de tiempo completo a su entrenamiento. Adicionalmente, invertiremos $1.800 millones en la adecuación del complejo deportivo de Armenia y en la construcción de 2 canchas sintéticas en municipios con menos de 30.000 habitantes.
+
+________________________________________
+
+Salud
+
+Pregunta: El sistema de salud en el Quindío enfrenta problemas de citas y atención. ¿Cómo lo resolverá? Respuesta: La solución es la digitalización. Implementaremos una plataforma unificada de citas médicas que permitirá a los pacientes agendar, cancelar y reprogramar sus citas desde su teléfono móvil o computadora. El objetivo es reducir el tiempo de espera para citas de medicina general a 48 horas y para especialistas a 15 días.
+
+Pregunta: ¿Qué hará para enfrentar la salud mental en el departamento? Respuesta: Crearemos la "Red de Apoyo Psicológico Departamental". Esta red contará con 50 psicólogos adscritos a los centros de salud que brindarán atención gratuita. Además, en alianza con universidades, ofreceremos talleres de gestión emocional en colegios y empresas.
+
+________________________________________
+
+Infraestructura y Medio Ambiente
+
+Pregunta: ¿Cómo planea mejorar el estado de las vías rurales, que son vitales para el sector agrícola? Respuesta: Destinaremos un fondo de $5.000 millones para el mejoramiento de vías terciarias, con un cronograma trimestral público. Usaremos un modelo de trabajo comunitario en el que la Gobernación aportará la maquinaria y el material, y las comunidades aportarán la mano de obra, agilizando la ejecución. Priorizaremos las vías que conectan a Salento, Filandia y Córdoba, por su impacto turístico y agrícola.
+
+Pregunta: ¿Qué hará para enfrentar el problema de la gestión de residuos sólidos y el saneamiento básico? Respuesta: Financiaremos la construcción de 2 centros de acopio de materiales reciclables en Armenia y Calarcá, en alianza con las asociaciones de recicladores de oficio. El objetivo es aumentar la tasa de reciclaje del 10% al 25% en 4 años.
+
+Pregunta: La protección de los ríos y fuentes de agua es crucial en el Quindío. ¿Qué medidas tomará para proteger los ecosistemas hídricos? Respuesta: Declararemos la cuenca del río Quindío y el río La Vieja como "áreas estratégicas de protección ambiental". Lideraremos un programa de reforestación masiva, sembrando 100.000 árboles nativos en las orillas de estos ríos en los primeros 2 años.
+
+Pregunta: ¿Cuál es su propuesta para la movilidad urbana en Armenia, especialmente ante la congestión del tráfico? Respuesta: Lanzaremos un plan de movilidad multimodal. Construiremos 10 km de ciclorrutas interconectadas en el centro y norte de Armenia, y modernizaremos 30 semáforos con tecnología "inteligente" para optimizar el flujo vehicular en las horas pico.
+
+________________________________________
+
+Corrupción y Gobernanza
+
+Pregunta: La corrupción es un problema recurrente. ¿Qué mecanismo implementará para garantizar la transparencia de su gestión? Respuesta: Implementaremos el "Sistema de Transparencia 360". Cada contrato superior a $50 millones será publicado en línea, con seguimiento en tiempo real del estado de ejecución, las facturas y los informes de interventoría. La ciudadanía podrá hacer comentarios y denuncias directamente en la plataforma, las cuales serán revisadas por un equipo especial de la Oficina de Transparencia.
+
+Pregunta: ¿Cómo garantizará que los cargos públicos se asignen por mérito y no por favores políticos? Respuesta: Crearemos el "Banco de Talento Público del Quindío". Los perfiles de los candidatos a cargos de libre nombramiento y remoción serán evaluados por una comisión externa, que garantizará que los nombramientos se hagan con base en la experiencia, la trayectoria y la idoneidad profesional, y no en la cercanía política.
+
+________________________________________
+
+Relaciones Interinstitucionales y Ciudadanía
+
+Pregunta: ¿Cómo planea trabajar con el Gobierno Nacional para traer recursos al Quindío? Respuesta: Crearemos una "Oficina de Proyectos Estratégicos" que se encargará de identificar y formular proyectos viables que cumplan con los lineamientos del Plan Nacional de Desarrollo. Con esto, buscaremos una inversión de al menos $150.000 millones en los primeros 2 años para proyectos de infraestructura vial y turística.
+
+Pregunta: ¿Qué espacio tendrán los jóvenes y las mujeres en su gobierno? Respuesta: Crearemos el "Gabinete Joven" y el "Gabinete Femenino", con reuniones trimestrales directas conmigo para la formulación de políticas públicas. El 40% de los cargos de dirección y coordinación en mi gobierno estarán ocupados por mujeres y jóvenes menores de 35 años.
+
+Pregunta: ¿Cuál es su mensaje para los quindianos que viven en el exterior y quieren contribuir al desarrollo del departamento? Respuesta: Abriremos la "Ventana Quindiana", una plataforma digital para que los quindianos en el exterior puedan invertir en proyectos de desarrollo local, ya sea a través de capital semilla o compartiendo su conocimiento a través de mentorías virtuales a emprendedores.
+
+Pregunta: ¿Cómo fomentará la participación ciudadana en su administración? Respuesta: Realizaremos un "Diálogo de Gobierno" anual en cada uno de los 12 municipios, donde presentaré los avances de mi gestión y responderé directamente a las preguntas de la ciudadanía. Todos los planes de inversión serán sometidos a audiencias públicas.
+
+Pregunta: ¿Cuál es su visión sobre el futuro de los municipios de la cordillera, como Salento y Córdoba? Respuesta: Mi visión es de "turismo de baja huella". Apoyaré a los emprendimientos locales de ecoturismo y gastronomía, y trabajaré con los Parques Nacionales para proteger el Valle de Cocora y las reservas naturales, limitando la capacidad de carga para evitar la masificación.
+
+Pregunta: ¿Qué hará para fortalecer la conexión entre la capital (Armenia) y el resto de los municipios? Respuesta: Implementaremos un sistema de transporte público intermunicipal más eficiente. Coordinaremos con las alcaldías para la construcción de una central de transferencia de pasajeros en Armenia. Además, trabajaremos en la mejora de las vías principales que conectan a la capital con los municipios.
+
+________________________________________
+
+Temas Complementarios
+
+Pregunta: ¿Cuál es su postura sobre el futuro de la industria turística post-pandemia? Respuesta: La pandemia nos enseñó a valorar el turismo de naturaleza. Invertiremos $1.000 millones en la promoción del Quindío como un "destino de bienestar", con énfasis en el agroturismo y las experiencias en fincas cafeteras.
+
+Pregunta: ¿Qué opina sobre la relación entre el gobierno y el sector privado? Respuesta: El sector privado es un socio, no un rival. Crearemos una "Mesa de Fomento a la Inversión" que se reunirá mensualmente para identificar cuellos de botella y crear un marco normativo que facilite la creación de empresas y la generación de empleo en el departamento.
+
+Pregunta: ¿Qué propone para el sector rural, más allá de la producción? Respuesta: Implementaremos el programa "Campo Conectado". Trabajaremos con las empresas de telecomunicaciones para llevar conectividad satelital a 100 veredas, facilitando el acceso a educación a distancia, teletrabajo y comercio electrónico para los productores.
+
+Pregunta: ¿Cuál es su posición frente a la minería ilegal y los cultivos ilícitos? Respuesta: Tolerancia cero. Crearemos un grupo élite con la Policía y el Ejército para desmantelar las estructuras de minería ilegal, con el uso de drones de vigilancia en las zonas críticas. Implementaremos un programa de sustitución voluntaria de cultivos ilícitos, ofreciendo a las familias campesinas alternativas productivas y apoyo técnico.
+
+Pregunta: ¿Qué hará para proyectar la marca "Quindío" a nivel nacional e internacional? Respuesta: Invertiremos $500 millones en una campaña de marketing digital en plataformas como Google y redes sociales para atraer a turistas de Estados Unidos, Canadá y España. La campaña estará centrada en el Paisaje Cultural Cafetero y en las experiencias únicas de la región, destacando al Quindío como el corazón de Colombia.
+
+Preguntas y Respuestas Adicionales
+
+Pregunta: ¿Cuál es su postura frente a la sostenibilidad de las fincas cafeteras familiares ante la fluctuación del precio del café? Respuesta: Defenderemos el precio interno del café. Crearemos un Fondo de Estabilización de Precios de $1.000 millones, capitalizado con aportes departamentales y cooperación internacional, para subsidiar a los pequeños productores cuando el precio por carga de café caiga por debajo del costo de producción.
+
+Pregunta: ¿Cómo piensa impulsar la economía circular y el reciclaje a nivel departamental? Respuesta: Implementaremos un Programa de Incentivos al Reciclaje. Las familias y empresas que certifiquen el 80% de su separación en la fuente recibirán un descuento del 5% en su impuesto predial, y las empresas recicladoras formales obtendrán un subsidio para la compra de maquinaria.
+
+Pregunta: ¿Cuál es su plan para mejorar la calidad de vida de los adultos mayores en el Quindío? Respuesta: Lanzaremos el programa "Mayores Productivos". En alianza con el SENA, ofreceremos talleres de oficios y manualidades. Crearemos un fondo para la comercialización de sus productos en ferias locales y en plataformas digitales, garantizándoles una fuente de ingresos digna.
+
+Pregunta: ¿Cómo enfrentará el desafío de la infraestructura para personas con discapacidad? Respuesta: Exigiremos que en toda obra pública nueva (parques, andenes, edificios) se incorporen rampas, señalización braille y senderos podotáctiles. Destinaremos $500 millones para adecuar los espacios públicos existentes en las cabeceras municipales.
+
+Pregunta: ¿Qué hará para fortalecer la identidad cultural del Paisaje Cultural Cafetero ante la globalización? Respuesta: Impulsaremos la enseñanza del patrimonio cultural cafetero en los colegios a través de una cátedra obligatoria. Financiaré la creación de "Rutas de Sabores y Saberes" para que los turistas puedan interactuar con artesanos, baristas y arrieros.
+
+Pregunta: ¿Cuál es su estrategia para atraer inversiones extranjeras al departamento? Respuesta: Crearemos una oficina de "Ventanilla Única" para la inversión extranjera, que agilizará los trámites de registro de empresas en un 50%. Acompañaremos a los inversionistas en todo el proceso y les ofreceremos beneficios fiscales en zonas de desarrollo prioritario.
+
+Pregunta: ¿Cómo se relacionará con las minorías étnicas y comunidades indígenas presentes en el Quindío? Respuesta: Conformaré la Mesa de Diálogo Étnico, con participación permanente de los líderes indígenas y afrocolombianos. Garantizaremos el respeto a sus territorios ancestrales y co-crearemos políticas públicas para la preservación de su cultura y la mejora de su calidad de vida.
+
+Pregunta: ¿Qué propone para el manejo de los animales domésticos y la protección de la fauna silvestre? Respuesta: Destinaremos $400 millones para construir y operar un Centro de Bienestar Animal en Armenia, que ofrecerá servicios de esterilización gratuita, vacunación y atención veterinaria de bajo costo. Además, fortaleceremos la autoridad ambiental para combatir el tráfico de fauna silvestre.
+
+Pregunta: ¿Qué hará para garantizar la seguridad alimentaria de las familias vulnerables? Respuesta: Fortaleceremos los bancos de alimentos y crearemos la Red de Huertas Comunitarias. Suministraremos capital semilla, herramientas y asistencia técnica a 500 familias vulnerables para que puedan sembrar sus propios alimentos orgánicos.
+
+Pregunta: ¿Cómo abordará el problema de los habitantes de calle en las principales ciudades del departamento? Respuesta: Mi enfoque será integral. En coordinación con la Secretaría de Salud y Bienestar Social, activaremos brigadas móviles que ofrezcan atención psicológica, de salud y programas de resocialización y capacitación para el empleo. No los criminalizaremos, los apoyaremos.
+
+Pregunta: ¿Cuál es su visión para el Aeropuerto Internacional El Edén? Respuesta: Buscaremos convertirlo en un hub logístico y de carga aérea. Impulsaremos la inversión para la expansión de su infraestructura, atrayendo a aerolíneas de bajo costo y de carga, lo que potenciará la exportación de nuestros productos agrícolas.
+
+Pregunta: ¿Cómo impulsará la industria de eventos y congresos en el departamento? Respuesta: Crearemos el "Fondo de Promoción de Eventos" de $500 millones, que cofinanciará la realización de congresos y eventos nacionales e internacionales en el Quindío. Esto dinamizará la hotelería, el comercio y el turismo.
+
+Pregunta: ¿Cuál es su postura frente a la exploración de recursos no renovables en el Quindío? Respuesta: Mi postura es de defensa total de nuestro patrimonio natural y hídrico. No permitiré la exploración ni la explotación de petróleo o minerales en el departamento. Nuestro oro es el agua, el café y el turismo sostenible.
+
+Pregunta: ¿Qué hará para apoyar a las comunidades campesinas que no se dedican al café? Respuesta: Diversificaremos el apoyo agrícola a otros productos como el aguacate, la mora y los cítricos. Crearemos centros de acopio y facilitaremos la comercialización directa con grandes cadenas de supermercados y exportadores, eliminando intermediarios.
+
+Pregunta: ¿Cómo fortalecerá la infraestructura tecnológica y la conectividad en las zonas rurales? Respuesta: En alianza con el Ministerio de las TIC, buscaremos la instalación de 100 puntos de Wi-Fi gratuito en parques y zonas comunes de los municipios y veredas más apartadas.
+
+Pregunta: ¿Qué propone para el desarrollo de la economía naranja en el Quindío? Respuesta: Crearemos la "Incubadora de Emprendimientos Creativos" en alianza con las universidades. Ofreceremos capital semilla, asesoría en propiedad intelectual y mercadeo a los proyectos de cine, música, diseño y artesanías.
+
+Pregunta: ¿Cómo promoverá el Quindío como un destino de turismo de aventura y deportivo? Respuesta: Invertiremos en la adecuación de senderos para senderismo y ciclismo de montaña, con señalización y puntos de asistencia. Organizaremos anualmente un Festival de Deportes de Aventura que atraiga a turistas nacionales e internacionales.
+
+Pregunta: ¿Qué hará para que las instituciones educativas estén más conectadas con el mercado laboral? Respuesta: Conformaremos mesas de trabajo entre rectores universitarios, directores del SENA y gremios empresariales para que la oferta académica responda a las necesidades de la región. El objetivo es que el 80% de los egresados encuentren empleo en los primeros 6 meses.
+
+Pregunta: ¿Cuál es su plan para dignificar el trabajo de los recicladores y de la población que vive del rebusque? Respuesta: Formalizaremos a las cooperativas de recicladores y les brindaremos apoyo técnico y económico para la compra de vehículos y maquinaria. Apoyaremos a los vendedores informales en la creación de asociaciones y les asignaremos espacios de trabajo dignos.
+
+Pregunta: ¿Qué propone para garantizar el acceso a la justicia y los servicios de las entidades públicas en las zonas más apartadas? Respuesta: Crearemos las "Jornadas de Gobierno Móvil". Brigadas de funcionarios de la Gobernación, la Registraduría y la Defensoría del Pueblo se trasladarán a los municipios y veredas más lejanas, llevando servicios como la expedición de documentos, asesoría jurídica y atención social.
+
+
+
+5.1. Hoja de Vida y Transparencia Financiera
+
+Javier Montoya es un líder con una trayectoria pública y privada impecable. Su experiencia no es un misterio; es el pilar de su capacidad para gobernar. A continuación, un resumen de su perfil y su compromiso con la transparencia.
+
+Hoja de Vida:
+
+Educación: Ingeniero Agroindustrial, Universidad del Quindío (2000). Especialización en Gerencia de Proyectos, Universidad EAFIT (2006).
+
+Experiencia Laboral:
+
+2007 - 2015: Fundador y Gerente General de "Cafés Especiales Quindío", empresa exportadora que llevó la marca regional a mercados en Europa y Asia.
+
+2016 - 2019: Secretario de Desarrollo Económico de Armenia. Lideró la creación del "Fondo Emprende" y la atracción de 5 empresas de tecnología, generando más de 1.500 empleos.
+
+2020 - 2024: Consultor privado en agronegocios y sostenibilidad.
+
+Declaración de Renta: Javier Montoya ha publicado un resumen de su declaración de renta y bienes de 2024, demostrando su compromiso con la transparencia. Sus ingresos provienen exclusivamente de su actividad profesional como consultor. No posee contratos con el Estado, ni ha sido investigado por ningún órgano de control.
+
+________________________________________
+
+5.2. Aclaraciones y Rumores Comunes
+
+En una campaña limpia, los rumores deben enfrentarse con la verdad. Javier Montoya no tiene nada que ocultar.
+
+Rumor 1: "Javier Montoya es un empresario sin experiencia política".
+
+Aclaración: La experiencia de Javier es la de un gestor. Como Secretario de Desarrollo Económico de Armenia, lideró políticas públicas, gestionó presupuestos de más de $50.000 millones y supervisó a más de 100 funcionarios. Su enfoque no es el de un político de carrera, sino el de un líder que logra resultados.
+
+Rumor 2: "Los recursos de la campaña de Montoya provienen de grandes financiadores externos".
+
+Aclaración: La campaña de Renovación Quindiana está financiada por más de 300 donantes, en su mayoría pequeños y medianos empresarios del Quindío, caficultores, profesionales y ciudadanos que creen en su visión. El 80% de los aportes no superan los 5 millones de pesos, demostrando que este es un proyecto de la gente.
+
+________________________________________
+
+5.3. Testimonios y Apoyos Públicos
+
+La mejor prueba de un buen liderazgo es el respaldo de la gente que lo conoce y ha trabajado con él.
+
+Marcela Pérez, Caficultora de Génova: "Cuando el precio del café se cayó, Javier Montoya fue el único que nos ayudó a crear una marca para venderlo a un mejor precio. Él sabe que nuestro futuro está en el campo, y no en la política de oficina."
+
+Carlos Ochoa, Emprendedor Tecnológico de Armenia: "Gracias a los programas que Javier impulsó cuando fue Secretario, mi empresa de software pudo crecer y hoy empleo a más de 20 jóvenes de la región. Él entiende que la tecnología es el futuro del Quindío."
+
+Laura Torres, Líder Comunitaria de La Tebaida: "Javier no es solo un candidato que viene a prometer. Él ha caminado nuestros barrios, conoce nuestras necesidades y, lo más importante, tiene un plan claro y detallado para la seguridad y el empleo de nuestra gente."
+
+________________________________________
+
+5.4. Sostenibilidad y Finanzas de la Campaña
+
+La transparencia es un pilar de nuestra gestión. Por eso, hemos dispuesto la información sobre el financiamiento y presupuesto de nuestra campaña.
+
+Presupuesto: El presupuesto de la campaña se estima en $1.500 millones, distribuidos de la siguiente manera:
+
+Publicidad y Medios Digitales: 40%
+
+Movilización y Eventos en Territorio: 30%
+
+Logística y Funcionamiento: 20%
+
+Reservas para Imprevistos: 10%
+
+Fuentes de Financiación: La campaña de Renovación Quindiana se financia de manera transparente y ética. Las fuentes de ingreso provienen principalmente de donaciones de personas naturales (80%) y de empresas locales (20%) comprometidas con el desarrollo regional. No aceptamos donaciones de empresas con contratos públicos ni de personas investigadas por la justicia.
+
+________________________________________
+
+5.5. Llamado a la Participación Ciudadana
+
+El Quindío de hoy no se construirá solo con un líder, sino con la participación de todos.
+
+Canales de Contacto:
+
+WhatsApp: +57 320 XXX XXXX (Envía tu pregunta o sugerencia).
+
+Redes Sociales: @JavierMontoyaGobernador (Instagram y Facebook).
+
+Correo Electrónico: contacto@javiermontoya.com
+
+Calendario de Eventos:
+
+2 de septiembre: Encuentro ciudadano en el Parque Bolívar, Armenia.
+
+9 de septiembre: Recorrido por las fincas cafeteras de Génova.
+
+15 de septiembre: Debate abierto con jóvenes en la Universidad del Quindío.
+
+20 de septiembre: Encuentro con el sector turístico en Salento.
+
+Tu apoyo, tu voz y tus ideas son cruciales. Con tu participación, construiremos el Quindío que merecemos.
+
+
+
+
+
+    """
+    text_chunks = re.split(r'(?<=[.?!])\s+', campaign_document.replace('\n', ' ').replace('•', '').replace('¿', '').replace('¡', ''))
+    text_chunks = [chunk.strip() for chunk in text_chunks if len(chunk.strip()) > 15]
+    if collection.count() != len(text_chunks):
+        print(f"Base de datos desincronizada (DB: {collection.count()}, DOC: {len(text_chunks)}). Recargando...")
+        if collection.count() > 0:
+            ids_to_delete = [f"doc_chunk_{i}" for i in range(collection.count())]
+            if ids_to_delete: collection.delete(ids=ids_to_delete)
+        res = openai.Embedding.create(input=text_chunks, engine="text-embedding-ada-002")
+        embeddings_list = [item['embedding'] for item in res['data']]
+        doc_ids = [f"doc_chunk_{i}" for i in range(len(text_chunks))]
+        collection.add(embeddings=embeddings_list, documents=text_chunks, ids=doc_ids)
+        print("¡Cerebro recargado!")
+    else:
+        print("El cerebro ya está cargado y sincronizado en el disco.")
+    CEREBRO_CARGADO = True
+    print("Verificación completa. El cerebro está listo.")
+
+def ask_candidato_ia(pregunta):
+    contexto = ""
+    try:
+        res_query = openai.Embedding.create(input=[pregunta], engine="text-embedding-ada-002")
+        query_embedding = res_query['data'][0]['embedding']
+        results = collection.query(query_embeddings=[query_embedding], n_results=12)
+        documentos = results.get('documents')
+        contexto = "\n\n".join(documentos[0]) if documentos else "SIN_CONTEXTO"
+    except Exception as e:
+        print(f"Error al buscar en ChromaDB: {e}")
+        return "Hubo un problema al consultar mi base de conocimiento.", "ERROR_CHROMA"
+
+    if contexto == "SIN_CONTEXTO":
+        return random.choice(FALLBACK_RESPONSES), "SIN_CONTEXTO"
+    
+    prompt_template = f"""
+    Tu Persona: Eres el Candidato Digital de Javier Montoya. Tu propósito es actuar como su portavoz, comunicando sus propuestas de manera clara, conectada y humana. Responde siempre en primera persona ("Mi propuesta es...", "Creo firmemente...").
+
+    Tu Misión: Analizar la "Pregunta del Ciudadano" y usar la "Información de Apoyo" para construir la mejor respuesta posible, siguiendo estas reglas jerárquicas:
+
+    --- INSTRUCCIONES JERÁRQUICAS ---
+
+    1.  **MANEJO DE HECHOS BIOGRÁFICOS Y ACUSACIONES (Máxima Prioridad):**
+        *   Si la pregunta es una afirmación o pregunta sobre un hecho personal (ej: "¿es cierto que fue futbolista?", "es usted corrupto", "¿está pagando por votos?"), y la "Información de Apoyo" **NO CONTIENE ESE HECHO**, tu primera oración DEBE ser una negación educada y directa. Ejemplos: "Esa información no es correcta.", "No, eso no es cierto.", "Mi campaña se financia de manera transparente, no de esa forma.".
+        *   **SOLO DESPUÉS** de haber negado el hecho, puedes usar el contexto relevante para redirigir la conversación hacia tus propuestas reales. (ej: "...Sin embargo, sí tengo un fuerte compromiso con el deporte...").
+
+    2.  **MANEJO DE PREGUNTAS DE OPINIÓN ("qué piensas de..."):**
+        *   Si la pregunta pide tu opinión sobre un tema amplio (ej: "qué piensas de la drogadicción"), y el contexto no menciona esa palabra exacta pero sí temas relacionados (ej: "microtráfico", "juventud", "seguridad"), **USA ESOS TEMAS RELACIONADOS** para construir una respuesta que refleje la postura del candidato. No digas que no tienes información. Sintetiza las propuestas existentes para responder a la intención de la pregunta.
+
+    3.  **SÍNTESIS Y PROFUNDIDAD (Comportamiento por Defecto):**
+        *   Para todas las demás preguntas, tu objetivo es ser un excelente comunicador. **LEE TODO EL CONTEXTO** proporcionado, incluso si los fragmentos parecen diferentes.
+        *   **CONECTA LAS IDEAS:** Sintetiza la información de múltiples fragmentos para dar una respuesta completa, elaborada y bien estructurada. No te limites a parafrasear un solo trozo de información.
+        *   **SÉ CONCISO PERO COMPLETO:** Mantén tus respuestas en 2 o 3 párrafos, pero asegúrate de que sean sustanciosos y respondan plenamente a la pregunta.
+
+    ---
+    Información de Apoyo (Fragmentos del plan de gobierno):
+    {contexto}
+    ---
+    Pregunta del Ciudadano:
+    "{pregunta}"
+
+    Respuesta como Portavoz de Javier Montoya:
+    """
+    try:
+        res_completion = openai.ChatCompletion.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt_template}], temperature=0.5)
+        return res_completion['choices'][0]['message']['content'], contexto
+    except Exception as e:
+        print(f"Error al generar la respuesta con OpenAI: {e}")
+        return "Tuve un inconveniente al formular la respuesta.", contexto
+
+# --- RUTA PRINCIPAL DE WHATSAPP ---
+@app.route("/whatsapp", methods=['POST'])
+def whatsapp_reply():
+    try:
+        start_time = time.time()
+        incoming_msg = request.values.get('Body', '').strip()
+        user_number = request.values.get('From', '')
+        media_items = request.values.get('NumMedia', '0')
+        print(f"RECIBIDO de {user_number}: '{incoming_msg}'")
+        
+        resp = MessagingResponse()
+        log_data = {'timestamp': datetime.utcnow().isoformat(), 'user_id': user_number, 'user_query': incoming_msg}
+
+        # Guardia 1: Multimedia
+        if int(media_items) > 0:
+            resp.message(MEDIA_FALLBACK_MESSAGE)
+            log_data.update({'retrieved_context': 'MULTIMEDIA', 'ai_response': MEDIA_FALLBACK_MESSAGE, 'moderation_flags': 'N/A', 'response_time_ms': int((time.time() - start_time) * 1000), 'topic': 'Otro', 'sentiment': 'Neutro'})
+            update_cumulative_log_on_hf(log_data)
+            return str(resp)
+        
+        # Guardia 2: Identidad
+        if any(keyword in incoming_msg.lower() for keyword in IDENTITY_KEYWORDS):
+            resp.message(IDENTITY_FALLBACK_MESSAGE)
+            log_data.update({'retrieved_context': 'IDENTIDAD', 'ai_response': IDENTITY_FALLBACK_MESSAGE, 'moderation_flags': 'N/A', 'response_time_ms': int((time.time() - start_time) * 1000), 'topic': 'Sobre el Candidato', 'sentiment': 'Neutro'})
+            update_cumulative_log_on_hf(log_data)
+            return str(resp)
+
+        # Guardia 3: Saludo de Bienvenida
+        current_time = time.time()
+        last_seen = USER_SESSIONS.get(user_number, 0)
+        is_new_session = (current_time - last_seen) > 86400
+        is_greeting = any(keyword in incoming_msg.lower() for keyword in GREETING_KEYWORDS)
+        
+        if is_new_session and is_greeting:
+            USER_SESSIONS[user_number] = current_time
+            resp.message(WELCOME_MESSAGE)
+            log_data.update({'retrieved_context': 'BIENVENIDA', 'ai_response': WELCOME_MESSAGE, 'moderation_flags': 'N/A', 'response_time_ms': int((time.time() - start_time) * 1000), 'topic': 'Saludo/Otro', 'sentiment': 'Neutro'})
+            update_cumulative_log_on_hf(log_data)
+            return str(resp)
+
+        # --- [!!! MODIFICACIÓN CLAVE !!!] ---
+        # Guardia 4: Moderación de Contenido (Ahora responde en lugar de callar)
+        try:
+            mod_response = openai.Moderation.create(input=incoming_msg)
+            if mod_response['results'][0]['flagged']:
+                print(f"Mensaje flageado por moderación: {incoming_msg}")
+                # Creamos una respuesta profesional para contenido ofensivo
+                safe_response = "Mi propósito es mantener una conversación respetuosa y centrada en las propuestas para el Quindío. No puedo continuar un diálogo que incluye lenguaje ofensivo. Si tienes alguna pregunta sobre el plan de gobierno, estaré encantado de responder."
+                resp.message(safe_response)
+                log_data.update({'retrieved_context': 'MODERADO', 'ai_response': safe_response, 'moderation_flags': 'FLAGEADO', 'response_time_ms': int((time.time() - start_time) * 1000), 'topic': 'Tóxico', 'sentiment': 'Negativo'})
+                update_cumulative_log_on_hf(log_data)
+                return str(resp)
+        except Exception as e:
+            print(f"ERROR: Falló la llamada a la API de Moderación: {e}")
+
+        # --- Flujo Principal de IA (si ninguna guardia se activa) ---
+        if not CEREBRO_CARGADO:
+            cargar_y_verificar_cerebro()
+        
+        respuesta_ia, contexto_recuperado = ask_candidato_ia(incoming_msg)
+        resp.message(respuesta_ia)
+        print(f"ENVIANDO a {user_number}: '{respuesta_ia[:50]}...'")
+        
+        USER_SESSIONS[user_number] = current_time
+        topic = classify_topic_api(incoming_msg)
+        sentiment = analyze_sentiment_api(incoming_msg)
+        
+        log_data.update({
+            'retrieved_context': contexto_recuperado, 'ai_response': respuesta_ia, 'moderation_flags': 'OK',
+            'response_time_ms': int((time.time() - start_time) * 1000), 'topic': topic, 'sentiment': sentiment
+        })
+        
+        update_cumulative_log_on_hf(log_data)
+        
+        return str(resp)
+    
+    except Exception as e:
+        print(f"¡¡¡ ERROR CRÍTICO NO MANEJADO EN /whatsapp !!!: {e}")
+        emergency_resp = MessagingResponse()
+        emergency_resp.message("En este momento estoy experimentando un problema técnico. Por favor, intenta de nuevo en un momento.")
+        return str(emergency_resp)
